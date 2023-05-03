@@ -1,0 +1,4 @@
+function-parser
+jsonlines
+jsonpickle
+langdetect
