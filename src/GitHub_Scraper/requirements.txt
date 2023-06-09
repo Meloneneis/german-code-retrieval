@@ -1,6 +1,0 @@
-requests~=2.29.0
-jsonpickle~=3.0.1
-urlfetch~=1.2.2
-langdetect~=1.0.9
-tqdm~=4.65.0
-jsonlines
