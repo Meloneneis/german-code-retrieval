@@ -1,26 +1,25 @@
-Interleave Dataset for Pretraining
+## Interleave Datasets for Pre-Training
 
-This tool combines multiple datasets into an interleaved dataset file for a pretraining task with masked language modeling (MLM). The merging process includes preprocessing steps and interleave operations to create an interleaved dataset.
+This script combines multiple datasets into an interleaved dataset file for a pre-training task. The merging process includes preprocessing steps and interleave operations to create an interleaved dataset.
 
-Functionality:
-- Loads and preprocesses datasets
-- Interleaves the datasets
-- Saves the interleaved dataset to a file
+### Dependencies
 
-Usage:
-1. Prepare the datasets:
-   - The tool supports merging multiple datasets for pretraining.
-   - Specify the datasets to merge and their corresponding configurations in the code.
-   - Make sure the necessary datasets and configurations are available for loading.
+    pip install tqdm
+    pip install datasets
+    
+### Example Usage
 
-2. Run the tool:
-   - Execute the script to start the merging process.
-   - The tool will load and preprocess the datasets, including any required preprocessing steps such as adding columns, mapping functions, or filtering examples.
-   - The datasets will be interleaved based on a specified distribution.
-   - Finally, the interleaved dataset will be saved to the specified output directory.
+    python interleave_datasets.py \
+       --datasets "oscar,wikipedia,code_search_net" \
+       --configs "unshuffled_deduplicated_de,20220301.de,all" \
+       --distribution "0.2,0.3,0.5" \
+       --validation_split_percentage 5 \
+       --cache_dir "cache" \
+       --output_dir "output_dir"
+The parameters `--datasets`, `--configs`, and `--distribution` are mapped by their indices, i.e. the dataset `oscar`, has `unshuffled_deduplicated_de` as config and `0.2` as distribution.
+		    
 
-Note:
+### Note:
 - Using the scripts on datasets other than wikipedia, oscar or code_search_net might not work!
-- The tool assumes the availability of the necessary datasets and configurations.
-- Customize the code and configurations according to your specific datasets and requirements.
+- Only RoBERTa tokenizers are supported when merging `code_search_net` dataset as the preprocessing consists of linking the documentation and code via the RoBERTa separator token
 
