@@ -2,6 +2,11 @@
 
 This script combines multiple datasets into an interleaved dataset file for a pre-training task. The merging process includes preprocessing steps and interleave operations to create an interleaved dataset.
 
+### Dependencies
+
+    pip install tqdm
+    pip install datasets
+    
 ### Example Usage
 
     python interleave_datasets.py \
