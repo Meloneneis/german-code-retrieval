@@ -108,13 +108,13 @@ def query_combinator(args):
 def main():
     argparser = argparse.ArgumentParser(description="Combine two datasets to produce a merge file")
 
-    argparser.add_argument("--lang", default="java", type=str)
-    argparser.add_argument("--queries", default="Klasse,zurück,Variable,Parameter", type=str)
+    argparser.add_argument("--lang", required=True, type=str)
+    argparser.add_argument("--queries", required=True, type=str)
     argparser.add_argument("--query_size", type=int, default=3)
     argparser.add_argument("--starcount", type=int, default=2)
-    argparser.add_argument("--output_dir", default="../../data/github/german_repository_names.json")
+    argparser.add_argument("--output_dir", required=True)
     argparser.add_argument("--spoken_language", default="de")
-    argparser.add_argument("--auth_token", default="<github token here>", type=str)
+    argparser.add_argument("--auth_token", required=True, type=str)
     args = argparser.parse_args()
 
     queries = query_combinator(args)

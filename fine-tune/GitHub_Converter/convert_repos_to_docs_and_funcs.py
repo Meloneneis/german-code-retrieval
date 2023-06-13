@@ -77,10 +77,10 @@ def remove_comments_and_docstrings(source, lang):
 def main():
     parser = argparse.ArgumentParser(description="Create docstring/function pairs from json file")
 
-    parser.add_argument("--lang", type=str, default="java")
-    parser.add_argument("--path_to_repos", type=str, default="../../data/github/german_respository_names.json")
-    parser.add_argument("--output_dir", type=str, default="../../data/github/raw_german_docs_and_funcs.jsonl")
-    parser.add_argument("--spoken_language", type=str, default="de")
+    parser.add_argument("--lang", type=str, required=True)
+    parser.add_argument("--path_to_repos", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--spoken_language", type=str, required=True)
     args = parser.parse_args()
 
     language = args.lang
