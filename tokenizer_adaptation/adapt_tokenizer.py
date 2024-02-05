@@ -3,6 +3,8 @@ from transformers import AutoTokenizer, AutoModel, RobertaForMaskedLM, RobertaTo
 import argparse
 import torch
 import collections
+import shutil
+import torch.nn.init as init
 
 
 def main():
@@ -11,7 +13,8 @@ def main():
     parser.add_argument("--source_tokenizer", type=str, required=True)
     parser.add_argument("--target_tokenizer", type=str, required=True)
     parser.add_argument("--n_new_tokens", type=int, required=True)
-    parser.add_argument("--output_dir", type=str, default="")
+    parser.add_argument("--output_dir", type=str, default="adapted_model_and_tok")
+    parser.add_argument("--use_target_embeddings", type=bool, default=True)
     args = parser.parse_args()
 
     target_tok = AutoTokenizer.from_pretrained(args.target_tokenizer)
@@ -76,7 +79,7 @@ def main():
             embedding = sum(embeddings) / len(embeddings)
         return embedding
 
-    all_numbers = set(i for i in range(source_tok.vocab_size + args.n_new_tokens))
+    all_numbers = set(i for i in range(tokenizer.vocab_size))
     indexes = [value["index"] for value in final_vocab.values()]
     missing_idx = sorted(list(all_numbers.difference(set(indexes))))
     subset_missing_idx = missing_idx[:len(difference)]
@@ -99,14 +102,22 @@ def main():
     final_model.resize_token_embeddings(len(tokenizer))
     for token in union:
         if final_vocab[token]["model"] != "source_lang":
-            with torch.no_grad():
-                final_model.roberta.embeddings.word_embeddings.weight[final_vocab[token]["index"]] = final_vocab[token]["embedding"]
+            with (torch.no_grad()):
+                if args.use_target_embeddings:
+                    final_model.roberta.embeddings.word_embeddings.weight[final_vocab[token]["index"]] = final_vocab[token]["embedding"]
+                else:
+                    embedding_dim = final_model.roberta.config.hidden_size
+                    fan_in = embedding_dim
+                    random_embedding = torch.Tensor(1, embedding_dim)
+                    init.kaiming_normal_(random_embedding, mode='fan_in', nonlinearity='leaky_relu')
+                    final_model.roberta.embeddings.word_embeddings.weight[final_vocab[token]["index"]] = random_embedding
 
     final_vocab = {k: v["index"] for k, v in final_vocab.items()}
     with open("vocab.json", "w") as fp:
         json.dump(final_vocab, fp)
     final_tok = RobertaTokenizerFast(vocab_file="vocab.json", merges_file="tokenizer/merges.txt",
                                      model_max_length=tokenizer.model_max_length)
+    shutil.rmtree("tokenizer")
     final_tok.save_pretrained(args.output_dir)
     final_model.save_pretrained(args.output_dir)
 
