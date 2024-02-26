@@ -5,14 +5,15 @@ import torch
 import collections
 import shutil
 import torch.nn.init as init
-
+import os
+import pickle
 
 def main():
     parser = argparse.ArgumentParser(description="Adapt an existing tokenizer")
 
-    parser.add_argument("--source_tokenizer", type=str, required=True)
-    parser.add_argument("--target_tokenizer", type=str, required=True)
-    parser.add_argument("--n_new_tokens", type=int, required=True)
+    parser.add_argument("--source_tokenizer", type=str, required=False, default="FacebookAI/roberta-base")
+    parser.add_argument("--target_tokenizer", type=str, required=False, default="wechsel")
+    parser.add_argument("--n_new_tokens", type=int, required=False, default=10000)
     parser.add_argument("--output_dir", type=str, default="adapted_model_and_tok")
     parser.add_argument("--use_target_embeddings", type=bool, default=True)
     args = parser.parse_args()
@@ -111,6 +112,28 @@ def main():
                     random_embedding = torch.Tensor(1, embedding_dim)
                     init.kaiming_normal_(random_embedding, mode='fan_in', nonlinearity='leaky_relu')
                     final_model.roberta.embeddings.word_embeddings.weight[final_vocab[token]["index"]] = random_embedding
+    source_lang_count = 0
+    target_lang_count = 0
+    helper_count = 0
+    for item in final_vocab.values():
+        model = item.get('model')
+        if model == 'source_lang':
+            source_lang_count += 1
+        elif model == 'target_lang':
+            target_lang_count += 1
+        else:
+            helper_count += 1
+
+    print(f"Number of source_lang: {source_lang_count}")
+    print(f"Number of target_lang: {target_lang_count}")
+    print(f"Number of helper tokens: {helper_count}")
+
+    source_indices = [v["index"] for k, v in final_vocab.items() if v["model"] == "source_lang"]
+    assert  len(source_indices) == source_lang_count
+    if not os.path.exists(args.output_dir):
+        os.mkdir(args.output_dir)
+    with open(f"{args.output_dir}/source_indices.pkl", "wb") as fp:  # Pickling
+        pickle.dump(source_indices, fp)
 
     final_vocab = {k: v["index"] for k, v in final_vocab.items()}
     with open("vocab.json", "w") as fp:
@@ -118,6 +141,7 @@ def main():
     final_tok = RobertaTokenizerFast(vocab_file="vocab.json", merges_file="tokenizer/merges.txt",
                                      model_max_length=tokenizer.model_max_length)
     shutil.rmtree("tokenizer")
+    os.remove("vocab.json")
     final_tok.save_pretrained(args.output_dir)
     final_model.save_pretrained(args.output_dir)
 
