@@ -30,13 +30,14 @@ import os
 import random
 from itertools import chain
 from pathlib import Path
+import pickle
 
 import datasets
 import torch
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from huggingface_hub import Repository, create_repo
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -70,17 +71,17 @@ def parse_args():
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default=None,
+        default="mlsum",
         help="The name of the dataset to use (via the datasets library).",
     )
     parser.add_argument(
         "--dataset_config_name",
         type=str,
-        default=None,
+        default="de",
         help="The configuration name of the dataset to use (via the datasets library).",
     )
     parser.add_argument(
-        "--train_file", type=str, default="encoded_texts.jsonl", help="A csv or a json file containing the training data."
+        "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
     )
     parser.add_argument(
         "--validation_file", type=str, default=None, help="A csv or a json file containing the validation data."
@@ -98,6 +99,7 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
+        default="adapted_model_and_tok",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
     )
@@ -121,13 +123,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=8,
+        default=4,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=8,
+        default=4,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -137,11 +139,11 @@ def parse_args():
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=5, help="Total number of training epochs to perform.")
+    parser.add_argument("--num_train_epochs", type=int, default=1, help="Total number of training epochs to perform.")
     parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=None,
+        default=20000,
         help="Total number of training steps to perform. If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
@@ -160,7 +162,7 @@ def parse_args():
     parser.add_argument(
         "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
-    parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
+    parser.add_argument("--output_dir", type=str, default="model_embedding_freeze", help="Where to store the final model.")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--model_type",
@@ -182,6 +184,49 @@ def parse_args():
         type=bool,
         default=False,
         help="Whether distinct lines of text in the dataset are to be handled as distinct sequences.",
+    )
+    parser.add_argument(
+        "--with_special_training",
+        type=bool,
+        default=False,
+        help="Whether to apply special tokenization for special training."
+    )
+    parser.add_argument(
+        "--with_freezing",
+        type=bool,
+        default=True,
+        help="Whether to apply special tokenization for special training."
+    )
+    parser.add_argument(
+        "--with_hook",
+        type=bool,
+        default=False,
+        help="Whether to apply special tokenization for special training."
+    )
+    parser.add_argument(
+        "--source_tokenizer_name",
+        type=str,
+        default="FacebookAI/roberta-base",
+        help="Whether to apply special tokenization for special training."
+    )
+    parser.add_argument(
+        "--pretokenized_dataset_name",
+        type=str,
+    )
+    parser.add_argument(
+        "--source_token_ratio",
+        type=float,
+        default=0.85
+    )
+    parser.add_argument(
+        "--load_processed_dataset",
+        type=bool,
+        default=True
+    )
+    parser.add_argument(
+        "--save_processed_dataset",
+        type=bool,
+        default=True,
     )
     parser.add_argument(
         "--preprocessing_num_workers",
@@ -226,11 +271,12 @@ def parse_args():
         "--with_tracking",
         action="store_true",
         help="Whether to enable experiment trackers for logging.",
+        default=True
     )
     parser.add_argument(
         "--report_to",
         type=str,
-        default="all",
+        default="wandb",
         help=(
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`,'
             ' `"wandb"`, `"comet_ml"` and `"clearml"`. Use `"all"` (default) to report to all integrations. '
@@ -283,7 +329,7 @@ def main():
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["project_dir"] = args.output_dir
 
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs)
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, mixed_precision="fp16", **accelerator_log_kwargs)
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -390,6 +436,10 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_name, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code
         )
+    if args.source_tokenizer_name:
+        source_tokenizer = AutoTokenizer.from_pretrained(
+            args.source_tokenizer_name, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code
+        )
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(
             args.model_name_or_path, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code
@@ -411,6 +461,31 @@ def main():
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForMaskedLM.from_config(config, trust_remote_code=args.trust_remote_code)
+
+    if args.with_special_training:
+        with open(f'{args.tokenizer_name}/source_indices.pkl', 'rb') as f:
+            source_indices = pickle.load(f)
+            source_indices_set = set(source_indices)
+    if args.with_freezing:
+        # Freeze all layers
+        for param in model.parameters():
+            param.requires_grad = False
+
+        for name, param in model.named_parameters():
+            if "embeddings" in name:
+                param.requires_grad = True
+
+    if args.with_hook:
+        def selective_freeze_hook(grad, indices_to_freeze):
+            mask = torch.ones_like(grad)
+            mask[indices_to_freeze, :] = 0
+            return grad * mask
+
+        freeze_hook = model.roberta.embeddings.word_embeddings.weight.register_hook(
+            lambda grad: selective_freeze_hook(grad, source_indices))
+
+    for name, param in model.named_parameters():
+        print(f"{name} is {'unfrozen' if param.requires_grad else 'frozen'}")
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
@@ -472,18 +547,64 @@ def main():
         # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
         # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
         # efficient when it receives the `special_tokens_mask`.
-        def tokenize_function(examples):
-            return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
+        #raw_datasets["train"] = raw_datasets["train"].select(range(10000))
+        #raw_datasets["validation"] = raw_datasets["validation"].select(range(1000))
+        #raw_datasets["test"] = raw_datasets["test"].select(range(1000))
+        if args.with_special_training:
+            def get_source_ratio(encoded_text, source_mask):
+                source_mask_set = set(source_mask)
+                total_count_encoded_text = len(encoded_text)
+                count_source_idx_in_encoded_text = sum(1 for idx in encoded_text if idx in source_mask_set)
+                ratio = count_source_idx_in_encoded_text / total_count_encoded_text if total_count_encoded_text else 0
+                return ratio
 
-        with accelerator.main_process_first():
-            tokenized_datasets = raw_datasets.map(
-                tokenize_function,
-                batched=True,
-                num_proc=args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not args.overwrite_cache,
-                desc="Running tokenizer on every text in dataset",
-            )
+            def flatten_list(lst):
+                flat_list = []
+                for item in lst:
+                    if isinstance(item, list):  # Check if the item is a list
+                        flat_list.extend(item)  # If so, extend the flat_list by adding elements of the sublist
+                    else:
+                        flat_list.append(item)  # If not, just append the item itself
+                return flat_list
+            def tokenize_function(examples):
+                encoded_text = tokenizer(examples["text"], return_special_tokens_mask=True)
+                source_ratio = get_source_ratio(encoded_text["input_ids"], source_indices)
+                if source_ratio < args.source_token_ratio:
+                    # mask out random new tokens with old tokens til source_ratio >= args.source_token_ratio
+                    # Calculate the number of tokens to mask to reach the target ratio
+                    num_tokens_to_mask = int(len(encoded_text["input_ids"]) * (args.source_token_ratio - source_ratio))
+                    target_tokens = [(pos, idx) for pos, idx in enumerate(encoded_text["input_ids"]) if
+                                     idx not in source_indices_set]
+                    random.shuffle(target_tokens)
+                    mask_target_tokens = target_tokens[:num_tokens_to_mask]
+                    for i, (pos, token) in enumerate(mask_target_tokens):
+                        decoded_mask_target_token = tokenizer.decode(token)
+                        encoded_new_source_tokens = source_tokenizer.encode(decoded_mask_target_token,
+                                                                            add_special_tokens=False)
+                        encoded_text["input_ids"][pos] = encoded_new_source_tokens
+                        attention_array = [1 for _ in range(len(encoded_new_source_tokens))]
+                        special_token_array = [0 for _ in range(len(encoded_new_source_tokens))]
+                        encoded_text["attention_mask"][pos] = attention_array
+                        encoded_text["special_tokens_mask"][pos] = special_token_array
+                    encoded_text["input_ids"] = flatten_list(encoded_text["input_ids"])
+                    encoded_text["attention_mask"] = flatten_list(encoded_text["attention_mask"])
+                    encoded_text["special_tokens_mask"] = flatten_list(encoded_text["special_tokens_mask"])
+                return encoded_text
+
+        else:
+            def tokenize_function(examples):
+                return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
+
+        if not args.load_processed_dataset:
+            with accelerator.main_process_first():
+                tokenized_datasets = raw_datasets.map(
+                    tokenize_function,
+                    batched=False,
+                    num_proc=args.preprocessing_num_workers,
+                    remove_columns=column_names,
+                    load_from_cache_file=not args.overwrite_cache,
+                    desc="Running tokenizer on every text in dataset",
+                )
 
         # Main data processing function that will concatenate all texts from our dataset and generate chunks of
         # max_seq_length.
@@ -507,19 +628,24 @@ def main():
         #
         # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
         # https://huggingface.co/docs/datasets/process#map
+        if not args.load_processed_dataset:
+            with accelerator.main_process_first():
+                tokenized_datasets = tokenized_datasets.map(
+                    group_texts,
+                    batched=True,
+                    num_proc=args.preprocessing_num_workers,
+                    load_from_cache_file=not args.overwrite_cache,
+                    desc=f"Grouping texts in chunks of {max_seq_length}",
+                )
 
-        with accelerator.main_process_first():
-            tokenized_datasets = tokenized_datasets.map(
-                group_texts,
-                batched=True,
-                num_proc=args.preprocessing_num_workers,
-                load_from_cache_file=not args.overwrite_cache,
-                desc=f"Grouping texts in chunks of {max_seq_length}",
-            )
-
-    train_dataset = tokenized_datasets["train"]
-    eval_dataset = tokenized_datasets["validation"]
-
+            train_dataset = tokenized_datasets["train"]
+            eval_dataset = tokenized_datasets["validation"]
+            if args.save_processed_dataset:
+                train_dataset.save_to_disk("datasets/train_baseline")
+                eval_dataset.save_to_disk("datasets/eval_baseline")
+        else:
+            train_dataset = load_from_disk("datasets/train_baseline")
+            eval_dataset = load_from_disk("datasets/eval_baseline")
     # Conditional for small test subsets
     if len(train_dataset) > 3:
         # Log a few random samples from the training set:

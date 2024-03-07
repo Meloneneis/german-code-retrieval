@@ -29,7 +29,7 @@ def main():
                         "embedding": target_model.embeddings.word_embeddings.weight[v]} for k, v in
                     target_tok.get_vocab().items()}
     target_vocab = {k: v for k, v in sorted(target_vocab.items(), key=lambda item: item[1]["index"])}
-    source_vocab = {k: {"index": v, "string": source_tok.convert_tokens_to_string([k]), "model": "source_lang",
+    source_vocab = {k: {"index": v, "string": source_tok.convert_tokens_to_string([k]) if source_tok.convert_tokens_to_string([k]) != "�" else k, "model": "source_lang",
                         "embedding": source_model.embeddings.word_embeddings.weight[v]} for k, v in
                     source_tok.get_vocab().items()}
     source_vocab = {k: v for k, v in sorted(source_vocab.items(), key=lambda item: item[1]["index"])}
@@ -129,7 +129,8 @@ def main():
     print(f"Number of helper tokens: {helper_count}")
 
     source_indices = [v["index"] for k, v in final_vocab.items() if v["model"] == "source_lang"]
-    assert  len(source_indices) == source_lang_count
+    print(len(source_indices))
+    assert len(source_indices) == source_lang_count
     if not os.path.exists(args.output_dir):
         os.mkdir(args.output_dir)
     with open(f"{args.output_dir}/source_indices.pkl", "wb") as fp:  # Pickling
