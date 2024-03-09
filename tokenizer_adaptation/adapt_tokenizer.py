@@ -11,7 +11,7 @@ import pickle
 def main():
     parser = argparse.ArgumentParser(description="Adapt an existing tokenizer")
 
-    parser.add_argument("--source_tokenizer", type=str, required=False, default="FacebookAI/roberta-base")
+    parser.add_argument("--source_tokenizer", type=str, required=False, default="microsoft/graphcodebert-base")
     parser.add_argument("--target_tokenizer", type=str, required=False, default="wechsel")
     parser.add_argument("--n_new_tokens", type=int, required=False, default=10000)
     parser.add_argument("--output_dir", type=str, default="adapted_model_and_tok")

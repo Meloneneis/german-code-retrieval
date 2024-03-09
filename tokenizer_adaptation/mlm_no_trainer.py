@@ -188,13 +188,13 @@ def parse_args():
     parser.add_argument(
         "--with_special_training",
         type=bool,
-        default=False,
+        default=True,
         help="Whether to apply special tokenization for special training."
     )
     parser.add_argument(
         "--with_freezing",
         type=bool,
-        default=True,
+        default=False,
         help="Whether to apply special tokenization for special training."
     )
     parser.add_argument(
@@ -206,12 +206,8 @@ def parse_args():
     parser.add_argument(
         "--source_tokenizer_name",
         type=str,
-        default="FacebookAI/roberta-base",
+        default="microsoft/graphcodebert-base",
         help="Whether to apply special tokenization for special training."
-    )
-    parser.add_argument(
-        "--pretokenized_dataset_name",
-        type=str,
     )
     parser.add_argument(
         "--source_token_ratio",
@@ -221,7 +217,7 @@ def parse_args():
     parser.add_argument(
         "--load_processed_dataset",
         type=bool,
-        default=True
+        default=False
     )
     parser.add_argument(
         "--save_processed_dataset",
@@ -381,7 +377,8 @@ def main():
     # download the dataset.
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
+        #raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
+        raw_datasets = load_from_disk("oscar0.25-wikipedia0.25-code_search_net0.5-trainvalid-dataset")
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
                 args.dataset_name,
@@ -566,10 +563,13 @@ def main():
                     else:
                         flat_list.append(item)  # If not, just append the item itself
                 return flat_list
+
+            source_ratios = []
             def tokenize_function(examples):
                 encoded_text = tokenizer(examples["text"], return_special_tokens_mask=True)
                 source_ratio = get_source_ratio(encoded_text["input_ids"], source_indices)
                 if source_ratio < args.source_token_ratio:
+                    source_ratios.append(source_ratio)
                     # mask out random new tokens with old tokens til source_ratio >= args.source_token_ratio
                     # Calculate the number of tokens to mask to reach the target ratio
                     num_tokens_to_mask = int(len(encoded_text["input_ids"]) * (args.source_token_ratio - source_ratio))
@@ -641,11 +641,11 @@ def main():
             train_dataset = tokenized_datasets["train"]
             eval_dataset = tokenized_datasets["validation"]
             if args.save_processed_dataset:
-                train_dataset.save_to_disk("datasets/train_baseline")
-                eval_dataset.save_to_disk("datasets/eval_baseline")
+                train_dataset.save_to_disk("ds/train85")
+                eval_dataset.save_to_disk("ds/eval85")
         else:
-            train_dataset = load_from_disk("datasets/train_baseline")
-            eval_dataset = load_from_disk("datasets/eval_baseline")
+            train_dataset = load_from_disk("ds/train85")
+            eval_dataset = load_from_disk("ds/eval85")
     # Conditional for small test subsets
     if len(train_dataset) > 3:
         # Log a few random samples from the training set:

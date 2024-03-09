@@ -3,7 +3,7 @@ import re
 from io import StringIO
 import tokenize
 import tqdm
-from datasets import load_dataset, interleave_datasets, DatasetDict, Dataset
+from datasets import load_dataset, interleave_datasets, DatasetDict, Dataset, load_from_disk
 import argparse
 
 
@@ -80,12 +80,12 @@ def map_doc_and_func(example):
 def main():
     parser = argparse.ArgumentParser(description="Combine two datasets to produce a merge file")
 
-    parser.add_argument("--datasets", type=str, required=True, help="Datasets delimited by ,")
-    parser.add_argument("--configs", type=str, required=True, help="Configs delimited by ,")
+    parser.add_argument("--datasets", type=str, default="code_search_net", help="Datasets delimited by ,")
+    parser.add_argument("--configs", type=str, default="all", help="Configs delimited by ,")
     parser.add_argument("--validation_split_percentage", type=int, default=5)
-    parser.add_argument("--distribution", type=str, required=True, help="Distribution delimited by ,")
-    parser.add_argument("--cache_dir", type=str, default=None)
-    parser.add_argument("--output_dir", type=str, default="")
+    parser.add_argument("--distribution", type=str, default="1", help="Distribution delimited by ,")
+    parser.add_argument("--cache_dir", type=str, default="cache_dir")
+    parser.add_argument("--output_dir", type=str, default="output_dir")
 
     args = parser.parse_args()
     datasets = args.datasets.split(',')
@@ -157,13 +157,21 @@ def main():
                 [col for col in oscar[split].column_names if col != "text"])
         dataset_list[oscar_index] = oscar
 
+    ds_train = load_from_disk("GermanTrain")
+    ds_eval = load_from_disk("GermanEval")
+    interleaved_train_dataset = interleave_datasets([dataset_list[0]["train"], ds_train], probabilities=[0.5,0.5])
+    interleaved_validation_dataset = interleave_datasets([dataset_list[0]["train"], ds_eval], probabilities=[0.5,0.5])
+    interleaved_dataset = DatasetDict(
+        {"train": interleaved_train_dataset, "validation": interleaved_validation_dataset})
+    interleaved_dataset.save_to_disk("GermanCodeDataset")
+    '''
     # Interleave datasets
     interleaved_train_dataset = interleave_datasets([x["train"] for x in dataset_list], probabilities=distribution)
     interleaved_validation_dataset = interleave_datasets([x["validation"] for x in dataset_list], probabilities=distribution)
     interleaved_dataset = DatasetDict({"train": interleaved_train_dataset, "validation": interleaved_validation_dataset})
     string_name = "-".join(f"{x}{y}" for (x, y) in zip(datasets, distribution))
     interleaved_dataset.save_to_disk(os.path.join(args.output_dir, string_name + "-trainvalid-dataset"))
-
+    '''
 
 if __name__ == "__main__":
     main()
