@@ -29,7 +29,8 @@ import warnings
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional
-
+import pickle
+import torch
 import datasets
 import evaluate
 from datasets import load_dataset, load_from_disk
@@ -54,7 +55,7 @@ from transformers.utils.versions import require_version
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.39.0.dev0")
+check_min_version("4.38.0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
 
@@ -63,14 +64,27 @@ MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
+class CustomTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        loss = super().compute_loss(model, inputs, return_outputs=False)
+        loss += 0
+        return loss
+
 @dataclass
 class ModelArguments:
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
     """
-
+    with_freeze_hook: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to register a freeze hook or not."
+            )
+        },
+    )
     model_name_or_path: Optional[str] = field(
-        default=None,
+        default="FacebookAI/roberta-base",
         metadata={
             "help": (
                 "The model checkpoint for weights initialization. Don't set if you want to train a model from scratch."
@@ -156,7 +170,7 @@ class DataTrainingArguments:
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
     local_dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the local dataset"}
+        default="UONLPGerman", metadata={"help": "The name of the local dataset"}
     )
     dataset_name: Optional[str] = field(
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
@@ -195,7 +209,7 @@ class DataTrainingArguments:
         default=0.15, metadata={"help": "Ratio of tokens to mask for masked language modeling loss"}
     )
     line_by_line: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether distinct lines of text in the dataset are to be handled as distinct sequences."},
     )
     pad_to_max_length: bool = field(
@@ -226,22 +240,11 @@ class DataTrainingArguments:
         },
     )
     streaming: bool = field(default=False, metadata={"help": "Enable streaming mode"})
-
+    output_dir: str = field(default="Test")
     def __post_init__(self):
         if self.streaming:
             require_version("datasets>=2.0.0", "The streaming feature requires `datasets>=2.0.0`")
 
-        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
-            raise ValueError("Need either a dataset name or a training/validation file.")
-        else:
-            if self.train_file is not None:
-                extension = self.train_file.split(".")[-1]
-                if extension not in ["csv", "json", "txt"]:
-                    raise ValueError("`train_file` should be a csv, a json or a txt file.")
-            if self.validation_file is not None:
-                extension = self.validation_file.split(".")[-1]
-                if extension not in ["csv", "json", "txt"]:
-                    raise ValueError("`validation_file` should be a csv, a json or a txt file.")
 
 
 def main():
@@ -256,6 +259,10 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+
+    training_args.output_dir = "test"
+
 
     if model_args.use_auth_token is not None:
         warnings.warn(
@@ -442,7 +449,27 @@ def main():
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForMaskedLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
+    if model_args.with_freeze_hook:
+        logger.info("Applying freeze hook...")
+        with open(f'{model_args.tokenizer_name}/source_indices.pkl', 'rb') as f:
+            source_indices = pickle.load(f)
+            source_indices_set = set(source_indices)
+        for param in model.parameters():
+            param.requires_grad = False
 
+        for name, param in model.named_parameters():
+            if "word_embeddings" in name:
+                param.requires_grad = True
+        def selective_freeze_hook(grad, indices_to_freeze):
+            mask = torch.ones_like(grad)
+            mask[indices_to_freeze, :] = 0
+            return grad * mask
+
+        freeze_hook = model.roberta.embeddings.word_embeddings.weight.register_hook(
+            lambda grad: selective_freeze_hook(grad, source_indices))
+
+        for name, param in model.named_parameters():
+            print(f"{name} is {'unfrozen' if param.requires_grad else 'frozen'}")
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
@@ -619,7 +646,7 @@ def main():
     )
 
     # Initialize our Trainer
-    trainer = Trainer(
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,

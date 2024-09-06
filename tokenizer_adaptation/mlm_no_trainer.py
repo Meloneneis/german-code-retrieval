@@ -472,7 +472,7 @@ def main():
             if "embeddings" in name:
                 param.requires_grad = True
 
-    if args.with_hook:
+    if args.with_freeze_hook:
         def selective_freeze_hook(grad, indices_to_freeze):
             mask = torch.ones_like(grad)
             mask[indices_to_freeze, :] = 0

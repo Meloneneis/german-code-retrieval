@@ -10,9 +10,9 @@ This script converts Github repositories to a func-and-documentation jsonl datas
 
     python convert_repos_to_docs_and_funcs.py \
        --lang "java" \
-       --path_to_repos "../../data/github/german_respository_names.json" \
+       --path_to_repos "../../data/github/german_repository_names.json" \
        --output_dir "../../data/github/raw_german_docs_and_funcs.jsonl" \
-       --spoken_language "de" \
+       --spoken_language "de"
 
 
 

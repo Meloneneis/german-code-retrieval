@@ -8,19 +8,25 @@ import torch.nn.init as init
 import os
 import pickle
 
+
+embeddings = AutoModel.from_pretrained("FacebookAI/roberta-base")
+embeddings.embeddings.word_embeddings.apply(embeddings._init_weights)
+
 def main():
     parser = argparse.ArgumentParser(description="Adapt an existing tokenizer")
 
     parser.add_argument("--source_tokenizer", type=str, required=False, default="microsoft/graphcodebert-base")
-    parser.add_argument("--target_tokenizer", type=str, required=False, default="wechsel")
+    parser.add_argument("--target_tokenizer", type=str, required=False, default="Code-Tokenizer")
     parser.add_argument("--n_new_tokens", type=int, required=False, default=10000)
-    parser.add_argument("--output_dir", type=str, default="adapted_model_and_tok")
+    parser.add_argument("--output_dir", type=str, default="GraphCodeCodeBERT")
     parser.add_argument("--use_target_embeddings", type=bool, default=True)
     args = parser.parse_args()
 
     target_tok = AutoTokenizer.from_pretrained(args.target_tokenizer)
-    target_model = AutoModel.from_pretrained(args.target_tokenizer)
-
+    target_model = AutoModel.from_pretrained(args.source_tokenizer)
+    for layer in target_model.encoder.layer:
+        layer.apply(target_model._init_weights)
+    target_model.embeddings.word_embeddings.apply(target_model._init_weights)
     source_tok = AutoTokenizer.from_pretrained(args.source_tokenizer)
     source_model = AutoModel.from_pretrained(args.source_tokenizer)
 
@@ -85,12 +91,16 @@ def main():
     missing_idx = sorted(list(all_numbers.difference(set(indexes))))
     subset_missing_idx = missing_idx[:len(difference)]
     zipped = zip(difference, subset_missing_idx)
-    temp = {pair[0]: {
-        "index": pair[1],
-        "string": None,
-        "model": None,
-        "embedding": get_embedding(pair[0])
-    } for pair in zipped}
+    counter = 1000
+    temp = {}
+    for pair in zipped:
+        temp[pair[0]] = {
+            "index": pair[1],
+            "string": None,
+            "model": None,
+            "embedding": embeddings.embeddings.word_embeddings.weight[counter]
+        }
+        counter += 1
     final_vocab.update(temp)
 
     indexes = [value["index"] for value in final_vocab.values()]
