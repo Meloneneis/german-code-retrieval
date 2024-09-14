@@ -25,15 +25,15 @@ import logging
 import math
 import os
 import sys
-import warnings
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional
-import pickle
-import torch
+
 import datasets
 import evaluate
+import torch
 from datasets import load_dataset, load_from_disk
+import torch.nn.functional as F
 
 import transformers
 from transformers import (
@@ -46,93 +46,22 @@ from transformers import (
     HfArgumentParser,
     Trainer,
     TrainingArguments,
-    is_torch_tpu_available,
+    is_torch_xla_available,
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
-import torch.nn.functional as F
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.38.0")
+check_min_version("4.40.0.dev0")
 
-require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
+require_version("datasets>=2.14.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
 
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-
-
-class CustomTrainer(Trainer):
-    def __init__(self, *args, alpha=0.5, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.alpha = alpha  # Hyperparameter to weight the MLM and Cosine loss
-
-    def compute_loss(self, model, inputs, return_outputs=False):
-        # Extract input_ids and attention_mask from inputs
-        input_ids = inputs['input_ids']
-        attention_mask = inputs['attention_mask']
-
-        # Assuming that the separator token (id 3) is used to split English and German documents
-        separator_token_id = 3
-
-        # Check if the separator token exists in the input_ids for each batch
-        sep_idx = (input_ids == separator_token_id).nonzero(as_tuple=True)
-
-        if len(sep_idx[1]) > 0:  # If separator token exists
-            sep_pos = sep_idx[1][0].item()
-
-            # Split inputs into English and German parts using the separator token
-            eng_input_ids = input_ids[:, :sep_pos]
-            ger_input_ids = input_ids[:, sep_pos + 1:]
-
-            eng_attention_mask = attention_mask[:, :sep_pos]
-            ger_attention_mask = attention_mask[:, sep_pos:]
-
-            # Prepare model inputs for English and German documents
-            eng_inputs = {"input_ids": eng_input_ids, "attention_mask": eng_attention_mask}
-            ger_inputs = {"input_ids": ger_input_ids, "attention_mask": ger_attention_mask}
-
-            # Forward pass for the target (German) MLM model
-            mlm_outputs = model(**ger_inputs)
-            mlm_loss = mlm_outputs.loss
-
-            # Forward pass for the source (English) model
-            source_outputs = model(**eng_inputs, output_hidden_states=True)
-            target_outputs = model(**ger_inputs, output_hidden_states=True)
-
-            # Mean pooling to get sentence-level embeddings
-            source_embeddings = self.mean_pooling(source_outputs, attention_mask=eng_attention_mask)
-            target_embeddings = self.mean_pooling(target_outputs, attention_mask=ger_attention_mask)
-
-            # Normalize embeddings
-            source_embeddings = F.normalize(source_embeddings, p=2, dim=1)
-            target_embeddings = F.normalize(target_embeddings, p=2, dim=1)
-
-            # Cosine similarity loss computation
-            cosine_loss_fn = torch.nn.CosineEmbeddingLoss()
-            target_similarity_scores = torch.ones(source_embeddings.size(0)).to(source_embeddings.device)
-            cosine_loss = cosine_loss_fn(source_embeddings, target_embeddings, target_similarity_scores)
-
-            # Weighted combination of MLM loss and Cosine loss using alpha
-            loss = self.alpha * mlm_loss + (1 - self.alpha) * cosine_loss
-        else:
-            # If no separator token, only compute the MLM loss
-            mlm_outputs = model(**inputs)
-            loss = mlm_outputs.loss
-
-        # Optionally return outputs
-        if return_outputs:
-            return loss, mlm_outputs
-        return loss
-
-    @staticmethod
-    def mean_pooling(model_output, attention_mask):
-        token_embeddings = model_output.hidden_states[-1]  # Last layer hidden states
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
 
 @dataclass
@@ -140,16 +69,9 @@ class ModelArguments:
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
     """
-    with_freeze_hook: Optional[bool] = field(
-        default=False,
-        metadata={
-            "help": (
-                "Whether to register a freeze hook or not."
-            )
-        },
-    )
+
     model_name_or_path: Optional[str] = field(
-        default="adapted_model_and_tok",
+        default=None,
         metadata={
             "help": (
                 "The model checkpoint for weights initialization. Don't set if you want to train a model from scratch."
@@ -196,20 +118,24 @@ class ModelArguments:
             )
         },
     )
-    use_auth_token: bool = field(
-        default=None,
-        metadata={
-            "help": "The `use_auth_token` argument is deprecated and will be removed in v4.34. Please use `token` instead."
-        },
-    )
     trust_remote_code: bool = field(
         default=False,
         metadata={
             "help": (
-                "Whether or not to allow for custom models defined on the Hub in their own modeling files. This option "
-                "should only be set to `True` for repositories you trust and in which you have read the code, as it will "
-                "execute code present on the Hub on your local machine."
+                "Whether to trust the execution of code from datasets/models defined on the Hub."
+                " This option should only be set to `True` for repositories you trust and in which you have read the"
+                " code, as it will execute code present on the Hub on your local machine."
             )
+        },
+    )
+    torch_dtype: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Override the default `torch.dtype` and load the model under this dtype. If `auto` is passed, the "
+                "dtype will be automatically derived from the model's weights."
+            ),
+            "choices": ["auto", "bfloat16", "float16", "float32"],
         },
     )
     low_cpu_mem_usage: bool = field(
@@ -234,9 +160,10 @@ class DataTrainingArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
-    local_dataset_name: Optional[str] = field(
-        default="TokenizedCombinedGermanEnglish", metadata={"help": "The name of the local dataset"}
+    local_tokenized_dataset_name: Optional[str] = field(
+        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
+    trainer_alpha: Optional[float] = field(default=0.9)
     dataset_name: Optional[str] = field(
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
@@ -274,7 +201,7 @@ class DataTrainingArguments:
         default=0.15, metadata={"help": "Ratio of tokens to mask for masked language modeling loss"}
     )
     line_by_line: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Whether distinct lines of text in the dataset are to be handled as distinct sequences."},
     )
     pad_to_max_length: bool = field(
@@ -305,11 +232,110 @@ class DataTrainingArguments:
         },
     )
     streaming: bool = field(default=False, metadata={"help": "Enable streaming mode"})
-    output_dir: str = field(default="Test")
+
     def __post_init__(self):
         if self.streaming:
             require_version("datasets>=2.0.0", "The streaming feature requires `datasets>=2.0.0`")
 
+        if (self.dataset_name is None and self.train_file is None and self.validation_file is None and
+                self.local_tokenized_dataset_name is None):
+            raise ValueError("Need either a dataset name or a training/validation file.")
+        else:
+            if self.train_file is not None:
+                extension = self.train_file.split(".")[-1]
+                if extension not in ["csv", "json", "txt"]:
+                    raise ValueError("`train_file` should be a csv, a json or a txt file.")
+            if self.validation_file is not None:
+                extension = self.validation_file.split(".")[-1]
+                if extension not in ["csv", "json", "txt"]:
+                    raise ValueError("`validation_file` should be a csv, a json or a txt file.")
+
+
+class CustomTrainer(Trainer):
+    def __init__(self, *args, alpha=0.5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha = alpha  # Hyperparameter to weight the MLM and Cosine loss
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        # Extract input_ids and attention_mask from inputs
+        input_ids = inputs['input_ids']
+        attention_mask = inputs['attention_mask']
+        labels = inputs["labels"]
+
+        # Assuming that the separator token (id 3) is used to split English and German documents
+        separator_token_id = 3
+
+        # Check if the separator token exists in the input_ids for each batch
+        sep_idx = (input_ids == separator_token_id).nonzero(as_tuple=True)
+
+        if len(sep_idx[1]) > 0:  # If separator token exists
+            sep_pos = sep_idx[1][0].item()
+
+            # Split inputs into English and German parts using the separator token
+            eng_input_ids = input_ids[:, :sep_pos]
+            ger_input_ids = input_ids[:, sep_pos + 1:]
+
+            eng_attention_mask = attention_mask[:, :sep_pos]
+            ger_attention_mask = attention_mask[:, sep_pos + 1:]
+
+            eng_labels = labels[:, :sep_pos].contiguous()
+            ger_labels = labels[:, sep_pos + 1:].contiguous()
+
+            # Unmask English input_ids by replacing masked tokens with labels
+            eng_input_ids_unmasked = eng_input_ids.clone()  # Clone to avoid in-place modification
+            mask = eng_labels != -100  # Create a mask where labels are not -100 (i.e., masked positions)
+            eng_input_ids_unmasked[mask] = eng_labels[mask]  # Replace masked tokens with actual labels
+
+            # Unmask German input_ids by replacing masked tokens with labels
+            ger_input_ids_unmasked = ger_input_ids.clone()  # Clone to avoid in-place modification
+            mask = ger_labels != -100  # Create a mask where labels are not -100 (i.e., masked positions)
+            ger_input_ids_unmasked[mask] = ger_labels[mask]  # Replace masked tokens with actual labels
+
+            # Prepare model inputs for English and German documents
+            eng_inputs = {"input_ids": eng_input_ids, "attention_mask": eng_attention_mask, "labels": eng_labels}
+            ger_inputs = {"input_ids": ger_input_ids, "attention_mask": ger_attention_mask, "labels": ger_labels}
+
+            eng_inputs_unmasked = {"input_ids": eng_input_ids_unmasked, "attention_mask": eng_attention_mask}
+            ger_input_unmasked = {"input_ids": ger_input_ids_unmasked, "attention_mask": ger_attention_mask}
+
+            # Forward pass for the target (German) MLM model
+            mlm_outputs = model(**ger_inputs)
+            mlm_loss = mlm_outputs.loss
+
+            # Forward pass for the source (English) model
+            source_outputs = model(**eng_inputs_unmasked, output_hidden_states=True)
+            target_outputs = model(**ger_input_unmasked, output_hidden_states=True)
+
+            # Mean pooling to get sentence-level embeddings
+            source_embeddings = self.mean_pooling(source_outputs, attention_mask=eng_attention_mask)
+            target_embeddings = self.mean_pooling(target_outputs, attention_mask=ger_attention_mask)
+
+            # Normalize embeddings
+            source_embeddings = F.normalize(source_embeddings, p=2, dim=1)
+            target_embeddings = F.normalize(target_embeddings, p=2, dim=1)
+
+            # Cosine similarity loss computation
+            cosine_loss_fn = torch.nn.CosineEmbeddingLoss()
+            target_similarity_scores = torch.ones(source_embeddings.size(0)).to(source_embeddings.device)
+            cosine_loss = cosine_loss_fn(source_embeddings, target_embeddings, target_similarity_scores)
+
+            # Weighted combination of MLM loss and Cosine loss using alpha
+            loss = self.alpha * mlm_loss + (1 - self.alpha) * cosine_loss
+        else:
+            # If no separator token, only compute the MLM loss
+            mlm_outputs = model(**inputs)
+            loss = mlm_outputs.loss
+
+        # Optionally return outputs
+        if return_outputs:
+            return loss, mlm_outputs
+        return loss
+
+    @staticmethod
+    def mean_pooling(model_output, attention_mask):
+        token_embeddings = model_output.hidden_states[-1]  # Last layer hidden states
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
 
 def main():
@@ -324,16 +350,6 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
-
-    if model_args.use_auth_token is not None:
-        warnings.warn(
-            "The `use_auth_token` argument is deprecated and will be removed in v4.34. Please use `token` instead.",
-            FutureWarning,
-        )
-        if model_args.token is not None:
-            raise ValueError("`token` and `use_auth_token` are both specified. Please set only the argument `token`.")
-        model_args.token = model_args.use_auth_token
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
@@ -392,67 +408,70 @@ def main():
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    if data_args.local_dataset_name is None:
-        if data_args.dataset_name is not None:
-            # Downloading and loading a dataset from the hub.
-            raw_datasets = load_dataset(
+    if data_args.local_tokenized_dataset_name is not None:
+        tokenized_datasets = load_from_disk(data_args.local_tokenized_dataset_name)
+    elif data_args.dataset_name is not None:
+        # Downloading and loading a dataset from the hub.
+        raw_datasets = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            cache_dir=model_args.cache_dir,
+            token=model_args.token,
+            streaming=data_args.streaming,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+        if "validation" not in raw_datasets.keys():
+            raw_datasets["validation"] = load_dataset(
                 data_args.dataset_name,
                 data_args.dataset_config_name,
+                split=f"train[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
                 streaming=data_args.streaming,
+                trust_remote_code=model_args.trust_remote_code,
             )
-            if "validation" not in raw_datasets.keys():
-                raw_datasets["validation"] = load_dataset(
-                    data_args.dataset_name,
-                    data_args.dataset_config_name,
-                    split=f"train[:{data_args.validation_split_percentage}%]",
-                    cache_dir=model_args.cache_dir,
-                    token=model_args.token,
-                    streaming=data_args.streaming,
-                )
-                raw_datasets["train"] = load_dataset(
-                    data_args.dataset_name,
-                    data_args.dataset_config_name,
-                    split=f"train[{data_args.validation_split_percentage}%:]",
-                    cache_dir=model_args.cache_dir,
-                    token=model_args.token,
-                    streaming=data_args.streaming,
-                )
-        else:
-            data_files = {}
-            if data_args.train_file is not None:
-                data_files["train"] = data_args.train_file
-                extension = data_args.train_file.split(".")[-1]
-            if data_args.validation_file is not None:
-                data_files["validation"] = data_args.validation_file
-                extension = data_args.validation_file.split(".")[-1]
-            if extension == "txt":
-                extension = "text"
-            raw_datasets = load_dataset(
+            raw_datasets["train"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=f"train[{data_args.validation_split_percentage}%:]",
+                cache_dir=model_args.cache_dir,
+                token=model_args.token,
+                streaming=data_args.streaming,
+                trust_remote_code=model_args.trust_remote_code,
+            )
+    else:
+        data_files = {}
+        if data_args.train_file is not None:
+            data_files["train"] = data_args.train_file
+            extension = data_args.train_file.split(".")[-1]
+        if data_args.validation_file is not None:
+            data_files["validation"] = data_args.validation_file
+            extension = data_args.validation_file.split(".")[-1]
+        if extension == "txt":
+            extension = "text"
+        raw_datasets = load_dataset(
+            extension,
+            data_files=data_files,
+            cache_dir=model_args.cache_dir,
+            token=model_args.token,
+        )
+
+        # If no validation data is there, validation_split_percentage will be used to divide the dataset.
+        if "validation" not in raw_datasets.keys():
+            raw_datasets["validation"] = load_dataset(
                 extension,
                 data_files=data_files,
+                split=f"train[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
             )
-
-            # If no validation data is there, validation_split_percentage will be used to divide the dataset.
-            if "validation" not in raw_datasets.keys():
-                raw_datasets["validation"] = load_dataset(
-                    extension,
-                    data_files=data_files,
-                    split=f"train[:{data_args.validation_split_percentage}%]",
-                    cache_dir=model_args.cache_dir,
-                    token=model_args.token,
-                )
-                raw_datasets["train"] = load_dataset(
-                    extension,
-                    data_files=data_files,
-                    split=f"train[{data_args.validation_split_percentage}%:]",
-                    cache_dir=model_args.cache_dir,
-                    token=model_args.token,
-                )
-
+            raw_datasets["train"] = load_dataset(
+                extension,
+                data_files=data_files,
+                split=f"train[{data_args.validation_split_percentage}%:]",
+                cache_dir=model_args.cache_dir,
+                token=model_args.token,
+            )
 
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.
@@ -498,40 +517,24 @@ def main():
         )
 
     if model_args.model_name_or_path:
+        torch_dtype = (
+            model_args.torch_dtype
+            if model_args.torch_dtype in ["auto", None]
+            else getattr(torch, model_args.torch_dtype)
+        )
         model = AutoModelForMaskedLM.from_pretrained(
             model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
             config=config,
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
             token=model_args.token,
             trust_remote_code=model_args.trust_remote_code,
-            low_cpu_mem_usage=model_args.low_cpu_mem_usage,
+            torch_dtype=torch_dtype
         )
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForMaskedLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
-    if model_args.with_freeze_hook:
-        logger.info("Applying freeze hook...")
-        with open(f'{model_args.tokenizer_name}/source_indices.pkl', 'rb') as f:
-            source_indices = pickle.load(f)
-            source_indices_set = set(source_indices)
-        for param in model.parameters():
-            param.requires_grad = False
 
-        for name, param in model.named_parameters():
-            if "word_embeddings" in name:
-                param.requires_grad = True
-        def selective_freeze_hook(grad, indices_to_freeze):
-            mask = torch.ones_like(grad)
-            mask[indices_to_freeze, :] = 0
-            return grad * mask
-
-        freeze_hook = model.roberta.embeddings.word_embeddings.weight.register_hook(
-            lambda grad: selective_freeze_hook(grad, source_indices))
-
-        for name, param in model.named_parameters():
-            print(f"{name} is {'unfrozen' if param.requires_grad else 'frozen'}")
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
@@ -540,136 +543,135 @@ def main():
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
-    if data_args.local_dataset_name is None:
-        if training_args.do_train:
-            column_names = list(raw_datasets["train"].features)
-        else:
-            column_names = list(raw_datasets["validation"].features)
-        text_column_name = "text" if "text" in column_names else column_names[0]
-
-        if data_args.max_seq_length is None:
-            max_seq_length = tokenizer.model_max_length
-            if max_seq_length > 1024:
-                logger.warning(
-                    "The chosen tokenizer supports a `model_max_length` that is longer than the default `block_size` value"
-                    " of 1024. If you would like to use a longer `block_size` up to `tokenizer.model_max_length` you can"
-                    " override this default with `--block_size xxx`."
-                )
-                max_seq_length = 1024
-        else:
-            if data_args.max_seq_length > tokenizer.model_max_length:
-                logger.warning(
-                    f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the "
-                    f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
-                )
-            max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
-
-        if data_args.line_by_line:
-            # When using line_by_line, we just tokenize each nonempty line.
-            padding = "max_length" if data_args.pad_to_max_length else False
-
-            def tokenize_function(examples):
-                # Remove empty lines
-                examples[text_column_name] = [
-                    line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
-                ]
-                return tokenizer(
-                    examples[text_column_name],
-                    padding=padding,
-                    truncation=True,
-                    max_length=max_seq_length,
-                    # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
-                    # receives the `special_tokens_mask`.
-                    return_special_tokens_mask=True,
-                )
-
-            with training_args.main_process_first(desc="dataset map tokenization"):
-                if not data_args.streaming:
-                    tokenized_datasets = raw_datasets.map(
-                        tokenize_function,
-                        batched=True,
-                        num_proc=data_args.preprocessing_num_workers,
-                        remove_columns=[text_column_name],
-                        load_from_cache_file=not data_args.overwrite_cache,
-                        desc="Running tokenizer on dataset line_by_line",
-                    )
-                else:
-                    tokenized_datasets = raw_datasets.map(
-                        tokenize_function,
-                        batched=True,
-                        remove_columns=[text_column_name],
-                    )
-        else:
-            # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
-            # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
-            # efficient when it receives the `special_tokens_mask`.
-            def tokenize_function(examples):
-                return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
-
-            with training_args.main_process_first(desc="dataset map tokenization"):
-                if not data_args.streaming:
-                    tokenized_datasets = raw_datasets.map(
-                        tokenize_function,
-                        batched=True,
-                        num_proc=data_args.preprocessing_num_workers,
-                        remove_columns=column_names,
-                        load_from_cache_file=not data_args.overwrite_cache,
-                        desc="Running tokenizer on every text in dataset",
-                    )
-                else:
-                    tokenized_datasets = raw_datasets.map(
-                        tokenize_function,
-                        batched=True,
-                        remove_columns=column_names,
-                    )
-
-            # Main data processing function that will concatenate all texts from our dataset and generate chunks of
-            # max_seq_length.
-            def group_texts(examples):
-                # Concatenate all texts.
-                concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-                total_length = len(concatenated_examples[list(examples.keys())[0]])
-                # We drop the small remainder, and if the total_length < max_seq_length  we exclude this batch and return an empty dict.
-                # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
-                total_length = (total_length // max_seq_length) * max_seq_length
-                # Split by chunks of max_len.
-                result = {
-                    k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
-                    for k, t in concatenated_examples.items()
-                }
-                return result
-
-            # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
-            # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
-            # might be slower to preprocess.
-            #
-            # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
-            # https://huggingface.co/docs/datasets/process#map
-
-            with training_args.main_process_first(desc="grouping texts together"):
-                if not data_args.streaming:
-                    tokenized_datasets = tokenized_datasets.map(
-                        group_texts,
-                        batched=True,
-                        num_proc=data_args.preprocessing_num_workers,
-                        load_from_cache_file=not data_args.overwrite_cache,
-                        desc=f"Grouping texts in chunks of {max_seq_length}",
-                    )
-                else:
-                    tokenized_datasets = tokenized_datasets.map(
-                        group_texts,
-                        batched=True,
-                    )
+    if data_args.local_tokenized_dataset_name:
+        print("Skipping tokenization...")
+    elif training_args.do_train:
+        column_names = list(raw_datasets["train"].features)
     else:
-        tokenized_datasets = load_from_disk(data_args.local_dataset_name)
+        column_names = list(raw_datasets["validation"].features)
+    text_column_name = "text"
+
+    if data_args.max_seq_length is None:
+        max_seq_length = tokenizer.model_max_length
+        if max_seq_length > 1024:
+            logger.warning(
+                "The chosen tokenizer supports a `model_max_length` that is longer than the default `block_size` value"
+                " of 1024. If you would like to use a longer `block_size` up to `tokenizer.model_max_length` you can"
+                " override this default with `--block_size xxx`."
+            )
+            max_seq_length = 1024
+    else:
+        if data_args.max_seq_length > tokenizer.model_max_length:
+            logger.warning(
+                f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the "
+                f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
+            )
+        max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
+    if data_args.local_tokenized_dataset_name:
+        print("Skipping tokenization...")
+    elif data_args.line_by_line:
+        # When using line_by_line, we just tokenize each nonempty line.
+        padding = "max_length" if data_args.pad_to_max_length else False
+
+        def tokenize_function(examples):
+            # Remove empty lines
+            examples[text_column_name] = [
+                line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
+            ]
+            return tokenizer(
+                examples[text_column_name],
+                padding=padding,
+                truncation=True,
+                max_length=max_seq_length,
+                # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
+                # receives the `special_tokens_mask`.
+                return_special_tokens_mask=True,
+            )
+
+        with training_args.main_process_first(desc="dataset map tokenization"):
+            if not data_args.streaming:
+                tokenized_datasets = raw_datasets.map(
+                    tokenize_function,
+                    batched=True,
+                    num_proc=data_args.preprocessing_num_workers,
+                    remove_columns=[text_column_name],
+                    load_from_cache_file=not data_args.overwrite_cache,
+                    desc="Running tokenizer on dataset line_by_line",
+                )
+            else:
+                tokenized_datasets = raw_datasets.map(
+                    tokenize_function,
+                    batched=True,
+                    remove_columns=[text_column_name],
+                )
+    else:
+        # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
+        # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
+        # efficient when it receives the `special_tokens_mask`.
+        def tokenize_function(examples):
+            return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
+
+        with training_args.main_process_first(desc="dataset map tokenization"):
+            if not data_args.streaming:
+                tokenized_datasets = raw_datasets.map(
+                    tokenize_function,
+                    batched=True,
+                    num_proc=data_args.preprocessing_num_workers,
+                    remove_columns=column_names,
+                    load_from_cache_file=not data_args.overwrite_cache,
+                    desc="Running tokenizer on every text in dataset",
+                )
+            else:
+                tokenized_datasets = raw_datasets.map(
+                    tokenize_function,
+                    batched=True,
+                    remove_columns=column_names,
+                )
+
+        # Main data processing function that will concatenate all texts from our dataset and generate chunks of
+        # max_seq_length.
+        def group_texts(examples):
+            # Concatenate all texts.
+            concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+            total_length = len(concatenated_examples[list(examples.keys())[0]])
+            # We drop the small remainder, and if the total_length < max_seq_length  we exclude this batch and return an empty dict.
+            # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+            total_length = (total_length // max_seq_length) * max_seq_length
+            # Split by chunks of max_len.
+            result = {
+                k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+                for k, t in concatenated_examples.items()
+            }
+            return result
+
+        # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
+        # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
+        # might be slower to preprocess.
+        #
+        # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
+        # https://huggingface.co/docs/datasets/process#map
+
+        with training_args.main_process_first(desc="grouping texts together"):
+            if not data_args.streaming:
+                tokenized_datasets = tokenized_datasets.map(
+                    group_texts,
+                    batched=True,
+                    num_proc=data_args.preprocessing_num_workers,
+                    load_from_cache_file=not data_args.overwrite_cache,
+                    desc=f"Grouping texts in chunks of {max_seq_length}",
+                )
+            else:
+                tokenized_datasets = tokenized_datasets.map(
+                    group_texts,
+                    batched=True,
+                )
+    print("if training_args.do_train:")
     if training_args.do_train:
-        if "train" not in tokenized_datasets:
-            raise ValueError("--do_train requires a train dataset")
-        train_dataset = tokenized_datasets["train"]
+        train_dataset = tokenized_datasets
         if data_args.max_train_samples is not None:
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
-
+    print("if training_args.do_eval:")
     if training_args.do_eval:
         if "validation" not in tokenized_datasets:
             raise ValueError("--do_eval requires a validation dataset")
@@ -700,6 +702,7 @@ def main():
 
     # Data collator
     # This one will take care of randomly masking the tokens.
+    print("Data collator")
     pad_to_multiple_of_8 = data_args.line_by_line and training_args.fp16 and not data_args.pad_to_max_length
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
@@ -708,16 +711,18 @@ def main():
     )
 
     # Initialize our Trainer
+    print("Initialize our Trainer")
     trainer = CustomTrainer(
         model=model,
         args=training_args,
+        alpha=data_args.trainer_alpha,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        compute_metrics=compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None,
+        compute_metrics=compute_metrics if training_args.do_eval and not is_torch_xla_available() else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
-        if training_args.do_eval and not is_torch_tpu_available()
+        if training_args.do_eval and not is_torch_xla_available()
         else None,
     )
 
@@ -728,6 +733,7 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
+        print("Starting Training..")
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()  # Saves the tokenizer too for easy upload
         metrics = train_result.metrics

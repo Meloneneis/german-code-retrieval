@@ -188,7 +188,7 @@ def parse_args():
     parser.add_argument(
         "--with_special_training",
         type=bool,
-        default=True,
+        default=False,
         help="Whether to apply special tokenization for special training."
     )
     parser.add_argument(
