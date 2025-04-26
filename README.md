@@ -1,6 +1,6 @@
 # German Code Retrieval
 
-This repository contains code and data for the paper "Teaching GraphCodeBERT German Code Retrieval".
+This repository contains code and data for my bachelor thesis "German Code Search through Knowledge Transfer".
 
 ## Directories
 
